@@ -5,33 +5,20 @@
 extern crate log;
 #[macro_use]
 extern crate const_cstr;
-#[macro_use]
-extern crate serde_json;
-#[macro_use]
-extern crate serde_derive;
 
 #[macro_use]
 mod macros;
-mod datis;
-mod error;
-mod srs;
-mod station;
-mod tts;
-mod utils;
-mod weather;
-mod worker;
 
 use std::ffi::CString;
 use std::ptr;
 
-use crate::datis::Datis;
-use crate::error::Error;
+use drsplayer::{Error, Player, Position};
 use hlua51::{Lua, LuaFunction, LuaTable};
 use libc::c_int;
 use lua51_sys as ffi;
 
 static mut INITIALIZED: bool = false;
-static mut DATIS: Option<Datis> = None;
+static mut PLAYER: Option<Player> = None;
 
 pub fn init(lua: &mut Lua<'_>) -> Result<(), Error> {
     unsafe {
@@ -43,24 +30,33 @@ pub fn init(lua: &mut Lua<'_>) -> Result<(), Error> {
 
     // init logging
     use log::LevelFilter;
+    use log4rs::append::console::ConsoleAppender;
     use log4rs::append::file::FileAppender;
     use log4rs::config::{Appender, Config, Logger, Root};
 
-    let mut lfs: LuaTable<_> = get!(lua, "lfs")?;
-    let mut writedir: LuaFunction<_> = get!(lfs, "writedir")?;
-    let writedir: String = writedir.call()?;
-    let log_file = writedir + "Logs\\DATIS.log";
+    let config = if let Some(mut lfs) = lua.get::<LuaTable<_>, _>("lfs") {
+        let mut writedir: LuaFunction<_> = get!(lfs, "writedir")?;
+        let writedir: String = writedir.call()?;
+        let log_file = writedir + "Logs/drs.log";
 
-    let requests = FileAppender::builder()
-        .append(false)
-        .build(log_file)
-        .unwrap();
+        let requests = FileAppender::builder()
+            .append(false)
+            .build(log_file)
+            .unwrap();
 
-    let config = Config::builder()
-        .appender(Appender::builder().build("file", Box::new(requests)))
-        .logger(Logger::builder().build("datis", LevelFilter::Info))
-        .build(Root::builder().appender("file").build(LevelFilter::Off))
-        .unwrap();
+        Config::builder()
+            .appender(Appender::builder().build("file", Box::new(requests)))
+            .logger(Logger::builder().build("drs", LevelFilter::Debug))
+            .build(Root::builder().appender("file").build(LevelFilter::Off))
+            .unwrap()
+    } else {
+        let stdout = ConsoleAppender::builder().build();
+        Config::builder()
+            .appender(Appender::builder().build("stdout", Box::new(stdout)))
+            .logger(Logger::builder().build("drs", LevelFilter::Debug))
+            .build(Root::builder().appender("stdout").build(LevelFilter::Off))
+            .unwrap()
+    };
 
     log4rs::init_config(config).unwrap();
 
@@ -70,23 +66,27 @@ pub fn init(lua: &mut Lua<'_>) -> Result<(), Error> {
 #[no_mangle]
 pub extern "C" fn start(state: *mut ffi::lua_State) -> c_int {
     unsafe {
-        if DATIS.is_none() {
+        if PLAYER.is_none() {
             let mut lua = Lua::from_existing_state(state, false);
+            let path: String = match lua.pop() {
+                Some(p) => p,
+                None => {
+                    return report_error(state, "path argument required");
+                }
+            };
 
             if let Err(err) = init(&mut lua) {
                 return report_error(state, &err.to_string());
             }
 
-            info!("Starting DATIS version {} ...", env!("CARGO_PKG_VERSION"));
+            info!(
+                "Starting SRS Player version {} ...",
+                env!("CARGO_PKG_VERSION")
+            );
 
-            match Datis::create(lua) {
-                Ok(mut datis) => {
-                    for client in datis.clients.iter_mut() {
-                        if let Err(err) = client.start() {
-                            return report_error(state, &err.to_string());
-                        }
-                    }
-                    DATIS = Some(datis);
+            match Player::create(lua) {
+                Ok(player) => {
+                    PLAYER = Some(player);
                 }
                 Err(err) => {
                     return report_error(state, &err.to_string());
@@ -101,11 +101,9 @@ pub extern "C" fn start(state: *mut ffi::lua_State) -> c_int {
 #[no_mangle]
 pub extern "C" fn stop(_state: *mut ffi::lua_State) -> c_int {
     unsafe {
-        if let Some(datis) = DATIS.take() {
+        if let Some(player) = PLAYER.take() {
             info!("Stopping ...");
-            for client in datis.clients.into_iter() {
-                client.stop()
-            }
+            player.stop()
         }
     }
 
@@ -115,11 +113,9 @@ pub extern "C" fn stop(_state: *mut ffi::lua_State) -> c_int {
 #[no_mangle]
 pub extern "C" fn pause(_state: *mut ffi::lua_State) -> c_int {
     unsafe {
-        if let Some(ref mut datis) = DATIS {
+        if let Some(ref mut player) = PLAYER {
             debug!("Pausing ...");
-            for client in &datis.clients {
-                client.pause()
-            }
+            player.pause()
         }
     }
 
@@ -129,11 +125,9 @@ pub extern "C" fn pause(_state: *mut ffi::lua_State) -> c_int {
 #[no_mangle]
 pub extern "C" fn unpause(_state: *mut ffi::lua_State) -> c_int {
     unsafe {
-        if let Some(ref mut datis) = DATIS {
+        if let Some(ref mut player) = PLAYER {
             debug!("Unpausing ...");
-            for client in &datis.clients {
-                client.unpause()
-            }
+            player.unpause()
         }
     }
 
@@ -153,7 +147,7 @@ fn report_error(state: *mut ffi::lua_State, msg: &str) -> c_int {
 
 #[no_mangle]
 #[allow(non_snake_case)]
-pub unsafe extern "C" fn luaopen_datis(state: *mut ffi::lua_State) -> c_int {
+pub unsafe extern "C" fn luaopen_drs(state: *mut ffi::lua_State) -> c_int {
     let registration = &[
         ffi::luaL_Reg {
             name: cstr!("start"),
@@ -177,7 +171,7 @@ pub unsafe extern "C" fn luaopen_datis(state: *mut ffi::lua_State) -> c_int {
         },
     ];
 
-    ffi::luaL_openlib(state, cstr!("datis"), registration.as_ptr(), 0);
+    ffi::luaL_openlib(state, cstr!("drs"), registration.as_ptr(), 0);
 
     1
 }

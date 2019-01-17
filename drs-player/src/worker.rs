@@ -35,9 +35,7 @@ impl<T> Worker<T> {
         if let Err(_) = self.tx.send(Command::Stop) {
             error!("Error sending stop signal to worker thread");
         }
-        if let Err(_) = self.join_handle.join() {
-            error!("Error joining worker thread");
-        }
+        self.join();
     }
 
     pub fn pause(&self) {
@@ -49,6 +47,12 @@ impl<T> Worker<T> {
     pub fn unpause(&self) {
         if let Err(_) = self.tx.send(Command::Unpause) {
             error!("Error sending unpause signal to worker thread");
+        }
+    }
+
+    pub fn join(self) {
+        if let Err(_) = self.join_handle.join() {
+            error!("Error joining worker thread");
         }
     }
 }

@@ -1,4 +1,6 @@
 [workspace]
 members = [
-    "datis",
+    "drs-module",
+    "drs-player",
+    "drs-cmd",
 ]

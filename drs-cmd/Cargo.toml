@@ -1,0 +1,11 @@
+[package]
+name = "dcs-radio-station"
+version = "0.1.0"
+authors = ["Markus Ast <m@rkusa.st>"]
+edition = "2018"
+
+[dependencies]
+drsplayer = { path = "../drs-player" }
+env_logger = "0.5"
+log = "0.4"
+clap = "2.32"

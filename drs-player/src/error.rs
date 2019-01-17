@@ -1,21 +1,13 @@
 use std::{error, fmt};
 
 // TODO: remove ugliness of this workaround ...
-type ArgsError1 = ::hlua51::LuaFunctionCallError<
-    ::hlua51::TuplePushError<
-        ::hlua51::Void,
-        ::hlua51::TuplePushError<::hlua51::Void, ::hlua51::Void>,
-    >,
->;
-type ArgsError2 =
+type ArgsError =
     ::hlua51::LuaFunctionCallError<::hlua51::TuplePushError<::hlua51::Void, ::hlua51::Void>>;
 
 #[derive(Debug)]
 pub enum Error {
     Lua(::hlua51::LuaError),
-    LuaFunctionCall(::hlua51::LuaFunctionCallError<::hlua51::Void>),
-    ArgsPush(ArgsError1),
-    GetPluginArgs(ArgsError2),
+    GetPluginArgs(ArgsError),
     // TODO: improve by including information about the global/key that was not defined
     Undefined(String),
     Tcp(std::io::Error),
@@ -23,8 +15,8 @@ pub enum Error {
     Request(reqwest::Error),
     Base64Decode(base64::DecodeError),
     Ogg(ogg::reading::OggReadError),
-    GcloudAccessKeyMissing,
-    GcloudTTL(serde_json::Value),
+    OggMetadata(ogg_metadata::OggMetadataError),
+    NoStationFound,
 }
 
 impl fmt::Display for Error {
@@ -38,9 +30,6 @@ impl fmt::Display for Error {
                 "Error: Trying to access undefined lua global or table key: {}",
                 key
             )?,
-            GcloudTTL(json) => {
-                write!(f, "Error calling Gcloud TTS service: {}", json.to_string(),)?
-            }
             _ => write!(f, "Error: {}", self.description())?,
         }
 
@@ -60,8 +49,6 @@ impl error::Error for Error {
 
         match *self {
             Lua(_) => "Lua error",
-            LuaFunctionCall(_) => "Error calling Lua function",
-            ArgsPush(_) => "Error pushing Lua function arguments",
             GetPluginArgs(_) => "Error pushing Lua function arguments for OptionsData.getPlugin",
             Undefined(_) => "Trying to access lua gobal or table key that does not exist",
             Tcp(_) => "Error establishing TCP connection to SRS",
@@ -69,8 +56,8 @@ impl error::Error for Error {
             Request(_) => "Error sending TTS request",
             Base64Decode(_) => "Error decoding TTS audio content",
             Ogg(_) => "Error decoding OGG audio stream",
-            GcloudAccessKeyMissing => "Google Cloud Access key is not set",
-            GcloudTTL(_) => "Error calling Gcloud TTS service",
+            OggMetadata(_) => "Error reading OGG metadata",
+            NoStationFound => "No SRS station found in mission",
         }
     }
 
@@ -79,12 +66,12 @@ impl error::Error for Error {
 
         match *self {
             Lua(ref err) => Some(err),
-            LuaFunctionCall(ref err) => Some(err),
             Tcp(ref err) => Some(err),
             Json(ref err) => Some(err),
             Request(ref err) => Some(err),
             Base64Decode(ref err) => Some(err),
             Ogg(ref err) => Some(err),
+            OggMetadata(ref err) => Some(err),
             _ => None,
         }
     }
@@ -96,20 +83,8 @@ impl From<::hlua51::LuaError> for Error {
     }
 }
 
-impl From<::hlua51::LuaFunctionCallError<::hlua51::Void>> for Error {
-    fn from(err: ::hlua51::LuaFunctionCallError<::hlua51::Void>) -> Self {
-        Error::LuaFunctionCall(err)
-    }
-}
-
-impl From<ArgsError1> for Error {
-    fn from(err: ArgsError1) -> Self {
-        Error::ArgsPush(err)
-    }
-}
-
-impl From<ArgsError2> for Error {
-    fn from(err: ArgsError2) -> Self {
+impl From<ArgsError> for Error {
+    fn from(err: ArgsError) -> Self {
         Error::GetPluginArgs(err)
     }
 }
@@ -141,5 +116,11 @@ impl From<base64::DecodeError> for Error {
 impl From<ogg::reading::OggReadError> for Error {
     fn from(err: ogg::reading::OggReadError) -> Self {
         Error::Ogg(err)
+    }
+}
+
+impl From<ogg_metadata::OggMetadataError> for Error {
+    fn from(err: ogg_metadata::OggMetadataError) -> Self {
+        Error::OggMetadata(err)
     }
 }

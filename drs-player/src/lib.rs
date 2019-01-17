@@ -1,59 +1,205 @@
+#![feature(try_trait)]
+#![warn(rust_2018_idioms)]
+
+#[macro_use]
+extern crate log;
+#[macro_use]
+extern crate serde_derive;
+
+#[macro_use]
+mod macros;
+mod error;
+mod worker;
+
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor, Write};
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{fmt, thread};
 
-use crate::error::Error;
-use crate::station::{Position, Station};
-use crate::tts::text_to_speech;
+pub use crate::error::Error;
 use crate::worker::{Context, Worker};
 use byteorder::{LittleEndian, WriteBytesExt};
+use hlua51::{Lua, LuaFunction, LuaTable};
 use ogg::reading::PacketReader;
 use uuid::Uuid;
+use ogg_metadata::{OggFormat, AudioMetadata};
+use either::Either;
 
 const MAX_FRAME_LENGTH: usize = 1024;
 
-pub struct AtisSrsClient {
+pub struct Player {
     sguid: String,
-    gcloud_key: String,
-    station: Station,
     worker: Vec<Worker<()>>,
+    name: String,
+    position: Position,
+    freq: u64,
 }
 
-impl AtisSrsClient {
-    pub fn new(station: Station, gcloud_key: String) -> Self {
+struct OpusFile {
+    path: PathBuf,
+    #[allow(unused)]
+    duration: Duration,
+}
+
+impl Player {
+    pub fn new(name: &str, position: Position, freq: u64) -> Self {
         let sguid = Uuid::new_v4();
         let sguid = base64::encode_config(sguid.as_bytes(), base64::URL_SAFE_NO_PAD);
         assert_eq!(sguid.len(), 22);
 
-        AtisSrsClient {
+        Player {
             sguid,
-            gcloud_key,
-            station,
             worker: Vec::new(),
+            name: name.to_string(),
+            position,
+            freq,
         }
     }
 
-    pub fn start(&mut self) -> Result<(), Error> {
+    pub fn create(mut lua: Lua<'_>) -> Result<Self, Error> {
+        debug!("Extracting ATIS stations from Mission Situation");
+
+        // extract all mission statics to later look for ATIS configs in their names
+        let mut comm_towers = {
+            // `_current_mission.mission.coalition.{blue,red}.country[i].static.group[j]
+            let mut current_mission: LuaTable<_> = get!(lua, "_current_mission")?;
+            let mut mission: LuaTable<_> = get!(current_mission, "mission")?;
+            let mut coalitions: LuaTable<_> = get!(mission, "coalition")?;
+
+            let mut comm_towers = Vec::new();
+            let keys = vec!["blue", "red"];
+            for key in keys {
+                let mut coalition: LuaTable<_> = get!(coalitions, key)?;
+                let mut countries: LuaTable<_> = get!(coalition, "country")?;
+
+                let mut i = 1;
+                while let Some(mut country) = countries.get::<LuaTable<_>, _, _>(i) {
+                    if let Some(mut statics) = country.get::<LuaTable<_>, _, _>("static") {
+                        if let Some(mut groups) = statics.get::<LuaTable<_>, _, _>("group") {
+                            let mut j = 1;
+                            while let Some(mut group) = groups.get::<LuaTable<_>, _, _>(j) {
+                                let x: f64 = get!(group, "x")?;
+                                let y: f64 = get!(group, "y")?;
+
+                                // read `group.units[1].unitId
+                                let mut units: LuaTable<_> = get!(group, "units")?;
+                                let mut first_unit: LuaTable<_> = get!(units, 1)?;
+                                let unit_id: i32 = get!(first_unit, "unitId")?;
+
+                                comm_towers.push(CommTower {
+                                    id: unit_id,
+                                    name: String::new(),
+                                    x,
+                                    y,
+                                    alt: 0.0,
+                                });
+
+                                j += 1;
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            comm_towers
+        };
+
+        // extract the names for all statics
+        {
+            // read `DCS.getUnitProperty`
+            let mut dcs: LuaTable<_> = get!(lua, "DCS")?;
+            let mut get_unit_property: LuaFunction<_> = get!(dcs, "getUnitProperty")?;
+            for mut tower in &mut comm_towers {
+                // 3 = DCS.UNIT_NAME
+                tower.name = get_unit_property.call_with_args((tower.id, 3))?;
+            }
+        }
+
+        // read the terrain height for all airdromes and statics
+        {
+            // read `Terrain.GetHeight`
+            let mut terrain: LuaTable<_> = get!(lua, "Terrain")?;
+            let mut get_height: LuaFunction<_> = get!(terrain, "GetHeight")?;
+
+            for mut tower in &mut comm_towers {
+                tower.alt = get_height.call_with_args((tower.x, tower.y))?;
+            }
+        }
+
+        let mut station = comm_towers
+            .into_iter()
+            .filter_map(|tower| {
+                if tower.name == "SRS Player" {
+                    Some(tower)
+                } else {
+                    None
+                }
+            })
+            .next();
+
+        if let Some(station) = station.take() {
+            Ok(Player::new(
+                "SRS Radio",
+                Position {
+                    x: station.x,
+                    y: station.y,
+                    alt: station.alt,
+                },
+                255_000_000,
+            ))
+        } else {
+            Err(Error::NoStationFound)
+        }
+    }
+
+    pub fn start<P: AsRef<Path>>(mut self, path: P, should_loop: bool) -> Result<(), Error> {
         if self.worker.len() > 0 {
             // already started
             return Ok(());
+        }
+
+        let file_paths: Vec<PathBuf> = if path.as_ref().is_dir() {
+            path.as_ref().read_dir()?.filter_map(|entry| {
+                entry.ok().map(|e| e.path())
+            }).collect()
+        } else {
+            vec![path.as_ref().into()]
+        };
+
+        let mut opus_files = Vec::new();
+        for path in file_paths {
+            if path.extension().is_none() || path.extension().unwrap() != "ogg" {
+                warn!("Ignoring non .ogg file: {:?}", path);
+                continue;
+            }
+            let mut f = File::open(&path)?;
+            if let Some(OggFormat::Opus(meta)) = ogg_metadata::read_format(&mut f)?.into_iter().next() {
+                if let Some(duration) = meta.get_duration() {
+                    opus_files.push(OpusFile { path, duration });
+                } else {
+                    error!("Failed reading duration of {}", path.to_string_lossy());
+                }
+            } else {
+                error!("{} is not opus encoded", path.to_string_lossy());
+            }
         }
 
         let mut stream = TcpStream::connect("127.0.0.1:5002")?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_millis(100)))?;
 
-        let name = format!("ATIS {}", self.station.name);
+        let name = format!("ATIS {}", self.name);
         let sync_msg = Message {
             client: Some(Client {
                 client_guid: &self.sguid,
                 name: &name,
-                position: self.station.airfield.position.clone(),
+                position: self.position.clone(),
                 coalition: Coalition::Blue,
                 radio_info: Some(RadioInfo {
                     name: "ATIS",
-                    pos: self.station.airfield.position.clone(),
+                    pos: self.position.clone(),
                     ptt: false,
                     radios: vec![Radio {
                         enc: false,
@@ -61,7 +207,7 @@ impl AtisSrsClient {
                         enc_mode: 0, // no encryption
                         freq_max: 1.0,
                         freq_min: 1.0,
-                        freq: self.station.atis_freq as f64,
+                        freq: self.freq as f64,
                         modulation: 0,
                         name: "ATIS",
                         sec_freq: 0.0,
@@ -88,20 +234,9 @@ impl AtisSrsClient {
 
         let mut rd = BufReader::new(stream.try_clone().unwrap()); // TODO: unwrap?
 
-        // spawn audio broadcast thread
-        let sguid = self.sguid.clone();
-        let gcloud_key = self.gcloud_key.clone();
-        let station = self.station.clone();
-        self.worker.push(Worker::new(move |ctx| {
-            if let Err(err) = audio_broadcast(ctx, sguid, gcloud_key, station) {
-                error!("Error starting SRS broadcast: {}", err);
-            }
-        }));
-
         // spawn thread that sends an update RPC call to SRS every ~5 seconds
         let sguid = self.sguid.clone();
-        let name = self.station.name.clone();
-        let mut position = self.station.airfield.position.clone();
+        let mut position = self.position.clone();
         position.alt += 100.0; // increase sending alt to 100ft above ground for LOS
         self.worker.push(Worker::new(move |ctx| {
             let mut send_update = || -> Result<(), Error> {
@@ -168,7 +303,20 @@ impl AtisSrsClient {
             }
         }));
 
-        // TODO: endless loop required?
+        // run audio broadcast
+        let sguid = self.sguid.clone();
+        let freq = self.freq;
+        let broadcast_worker = Worker::new(move |ctx| {
+            if let Err(err) = audio_broadcast(ctx, sguid, freq, opus_files, should_loop) {
+                error!("Error starting SRS broadcast: {}", err);
+            }
+        });
+        // self.worker.push(broadcast_worker);
+        broadcast_worker.join();
+
+        // if we looping, we will never reach this position, if we aren't looping, stop
+        // all other workers since we are done
+        self.stop();
 
         Ok(())
     }
@@ -192,70 +340,51 @@ impl AtisSrsClient {
     }
 }
 
+struct CommTower {
+    id: i32,
+    name: String,
+    x: f64,
+    y: f64,
+    alt: f64,
+}
+
 fn audio_broadcast(
     ctx: Context,
     sguid: String,
-    gloud_key: String,
-    station: Station,
+    freq: u64,
+    files: Vec<OpusFile>,
+    should_loop: bool,
 ) -> Result<(), Error> {
-    let interval = Duration::from_secs(60 * 60); // 60min
-    let mut interval_start;
-    let mut report_ix = 0;
-    loop {
-        interval_start = Instant::now();
+    let mut stream = TcpStream::connect("127.0.0.1:5003")?;
+    stream.set_nodelay(true)?;
 
-        // TODO: unwrap
-        let report = station.generate_report(report_ix)?;
-        report_ix += 1;
-        debug!("Report: {}", report);
+    let iter = if  should_loop {
+        Either::Left(files.iter().cycle())
+    } else {
+        Either::Right(files.iter())
+    };
+    for OpusFile { ref path, .. } in iter {
+        debug!("Playing {}", path.to_string_lossy());
 
-        let data = text_to_speech(&gloud_key, &report, station.voice)?;
-        let mut data = Cursor::new(data);
+        let file = File::open(&path)?;
 
-        let mut stream = TcpStream::connect("127.0.0.1:5003")?;
-        stream.set_nodelay(true)?;
-
-        loop {
-            let elapsed = Instant::now() - interval_start;
-            if elapsed > interval {
-                // every 60min, generate a new report
-                break;
+        let start = Instant::now();
+        let mut size = 0;
+        let mut audio = PacketReader::new(file);
+        let mut id: u64 = 1;
+        while let Some(pck) = audio.read_packet()? {
+            let pck_size = pck.data.len();
+            if pck_size == 0 {
+                continue;
             }
+            size += pck_size;
 
-            data.set_position(0);
-            let start = Instant::now();
-            let mut size = 0;
-            let mut audio = PacketReader::new(data);
-            let mut id: u64 = 1;
-            while let Some(pck) = audio.read_packet()? {
-                let pck_size = pck.data.len();
-                if pck_size == 0 {
-                    continue;
-                }
-                size += pck_size;
-                let frame = pack_frame(&sguid, id, station.atis_freq, &pck.data)?;
-                stream.write(&frame)?;
-                id += 1;
-
-                // 32 kBit/s
-                let secs = (size * 8) as f64 / 1024.0 / 32.0;
-
-                let playtime = Duration::from_millis((secs * 1000.0) as u64);
-                let elapsed = Instant::now() - start;
-                if playtime > elapsed {
-                    thread::sleep(playtime - elapsed);
-                }
-
-                if ctx.should_stop() {
-                    return Ok(());
-                }
-            }
-
-            debug!("TOTAL SIZE: {}", size);
+            let frame = pack_frame(&sguid, id, freq, &pck.data)?;
+            stream.write(&frame)?;
+            id += 1;
 
             // 32 kBit/s
             let secs = (size * 8) as f64 / 1024.0 / 32.0;
-            debug!("SECONDS: {}", secs);
 
             let playtime = Duration::from_millis((secs * 1000.0) as u64);
             let elapsed = Instant::now() - start;
@@ -263,15 +392,29 @@ fn audio_broadcast(
                 thread::sleep(playtime - elapsed);
             }
 
-            if ctx.should_stop_timeout(Duration::from_secs(3)) {
+            if ctx.should_stop() {
                 return Ok(());
             }
+        }
 
-            data = audio.into_inner();
+        debug!("TOTAL SIZE: {}", size);
+
+        // 32 kBit/s
+        let secs = (size * 8) as f64 / 1024.0 / 32.0;
+        debug!("SECONDS: {}", secs);
+
+        let playtime = Duration::from_millis((secs * 1000.0) as u64);
+        let elapsed = Instant::now() - start;
+        if playtime > elapsed {
+            thread::sleep(playtime - elapsed);
+        }
+
+        if ctx.should_stop_timeout(Duration::from_secs(3)) {
+            return Ok(());
         }
     }
 
-    //    Ok(())
+    Ok(())
 }
 
 fn pack_frame(sguid: &str, id: u64, freq: u64, rd: &Vec<u8>) -> Result<Vec<u8>, io::Error> {
@@ -323,6 +466,15 @@ fn pack_frame(sguid: &str, id: u64, freq: u64, rd: &Vec<u8>) -> Result<Vec<u8>, 
     frame.write_u16::<LittleEndian>(len_frequency as u16)?;
 
     Ok(frame.into_inner())
+}
+
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+pub struct Position {
+    pub x: f64,
+    #[serde(rename = "z")]
+    pub y: f64,
+    #[serde(rename = "y")]
+    pub alt: f64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
