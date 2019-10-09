@@ -226,7 +226,7 @@ impl Player {
                 }),
             }),
             msg_type: MsgType::Sync,
-            version: "1.5.3.5",
+            version: "1.6.0.0",
         };
 
         serde_json::to_writer(&stream, &sync_msg)?;
