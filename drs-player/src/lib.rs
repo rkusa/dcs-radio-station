@@ -1,4 +1,3 @@
-#![feature(try_trait)]
 #![warn(rust_2018_idioms)]
 
 #[macro_use]
@@ -11,7 +10,6 @@ mod macros;
 mod error;
 mod worker;
 
-use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -22,10 +20,9 @@ pub use crate::error::Error;
 use crate::worker::{Context, Worker};
 use byteorder::{LittleEndian, WriteBytesExt};
 use hlua51::{Lua, LuaFunction, LuaTable};
-use ogg::reading::PacketReader;
 use uuid::Uuid;
-use ogg_metadata::{OggFormat, AudioMetadata};
 use either::Either;
+use audiopus::{coder::Encoder, Application, Channels, SampleRate};
 
 const MAX_FRAME_LENGTH: usize = 1024;
 
@@ -37,7 +34,7 @@ pub struct Player {
     freq: u64,
 }
 
-struct OpusFile {
+struct AudioFile {
     path: PathBuf,
     #[allow(unused)]
     duration: Duration,
@@ -168,21 +165,20 @@ impl Player {
             vec![path.as_ref().into()]
         };
 
-        let mut opus_files = Vec::new();
+        let mut audio_files = Vec::new();
         for path in file_paths {
-            if path.extension().is_none() || path.extension().unwrap() != "ogg" {
-                warn!("Ignoring non .ogg file: {:?}", path);
+            if path.extension().is_none() || path.extension().unwrap() != "wav" {
+                warn!("Ignoring non .wav file: {:?}", path);
                 continue;
             }
-            let mut f = File::open(&path)?;
-            if let Some(OggFormat::Opus(meta)) = ogg_metadata::read_format(&mut f)?.into_iter().next() {
-                if let Some(duration) = meta.get_duration() {
-                    opus_files.push(OpusFile { path, duration });
-                } else {
-                    error!("Failed reading duration of {}", path.to_string_lossy());
+            match hound::WavReader::open(&path) {
+                Ok(wav) => {
+                    let spec = wav.spec();
+                    audio_files.push(AudioFile { path, duration: Duration::from_secs(u64::from(wav.duration() / spec.sample_rate)) });
                 }
-            } else {
-                error!("{} is not opus encoded", path.to_string_lossy());
+                Err(err) => {
+                    error!("reading wav file {} failed with: {}", path.to_string_lossy(), err);
+                }
             }
         }
 
@@ -307,7 +303,7 @@ impl Player {
         let sguid = self.sguid.clone();
         let freq = self.freq;
         let broadcast_worker = Worker::new(move |ctx| {
-            if let Err(err) = audio_broadcast(ctx, sguid, freq, opus_files, should_loop) {
+            if let Err(err) = audio_broadcast(ctx, sguid, freq, audio_files, should_loop) {
                 error!("Error starting SRS broadcast: {}", err);
             }
         });
@@ -352,7 +348,7 @@ fn audio_broadcast(
     ctx: Context,
     sguid: String,
     freq: u64,
-    files: Vec<OpusFile>,
+    files: Vec<AudioFile>,
     should_loop: bool,
 ) -> Result<(), Error> {
     let mut stream = TcpStream::connect("127.0.0.1:5003")?;
@@ -363,39 +359,61 @@ fn audio_broadcast(
     } else {
         Either::Right(files.iter())
     };
-    for OpusFile { ref path, .. } in iter {
+    for AudioFile { ref path, .. } in iter {
         debug!("Playing {}", path.to_string_lossy());
-
-        let file = File::open(&path)?;
 
         let start = Instant::now();
         let mut size = 0;
-        let mut audio = PacketReader::new(file);
         let mut id: u64 = 1;
-        while let Some(pck) = audio.read_packet()? {
-            let pck_size = pck.data.len();
-            if pck_size == 0 {
-                continue;
+
+        let mut wav =  hound::WavReader::open(path)?;
+        // Note: SampleRate::Hz16000 didn't work
+        let enc = Encoder::new(SampleRate::Hz24000, Channels::Mono, Application::Voip)?;
+
+        // e.g. 24000Hz * 1 channel * 20 ms / 1000
+        const MONO_20MS: usize = 24000 * 1 * 20 / 1000;
+        let mut buffer = [0_i16; MONO_20MS];
+
+        // Note:The following didn't work
+        // let spec = wav.spec();
+        // let mono20ms = spec.sample_rate * u32::from(spec.channels) * 20 / 1000;
+        // let mut buffer = Vec::with_capacity(mono20ms);
+
+        let mut i = 0;
+        let mut output = [0; 256];
+
+        for s in wav.samples::<i16>() {
+            if i >= buffer.len() {
+                let len = enc
+                    .encode(&buffer, &mut output)?;
+                
+                size += len;
+                        
+                let frame = pack_frame(&sguid, id, freq, &output[..len])?;
+                stream.write(&frame)?;
+                id += 1;
+
+                // 32 kBit/s
+                let secs = (size * 8) as f64 / 1024.0 / 32.0;
+
+                let playtime = Duration::from_millis((secs * 1000.0) as u64);
+                let elapsed = Instant::now() - start;
+                if playtime > elapsed {
+                    thread::sleep(playtime - elapsed);
+                }
+
+                if ctx.should_stop() {
+                    return Ok(());
+                }
+
+                i = 0;
             }
-            size += pck_size;
 
-            let frame = pack_frame(&sguid, id, freq, &pck.data)?;
-            stream.write(&frame)?;
-            id += 1;
+            let s = s.unwrap();
+            buffer[i] = s;
 
-            // 32 kBit/s
-            let secs = (size * 8) as f64 / 1024.0 / 32.0;
-
-            let playtime = Duration::from_millis((secs * 1000.0) as u64);
-            let elapsed = Instant::now() - start;
-            if playtime > elapsed {
-                thread::sleep(playtime - elapsed);
-            }
-
-            if ctx.should_stop() {
-                return Ok(());
-            }
-        }
+            i += 1;
+        } 
 
         debug!("TOTAL SIZE: {}", size);
 
@@ -417,7 +435,7 @@ fn audio_broadcast(
     Ok(())
 }
 
-fn pack_frame(sguid: &str, id: u64, freq: u64, rd: &Vec<u8>) -> Result<Vec<u8>, io::Error> {
+fn pack_frame(sguid: &str, id: u64, freq: u64, rd: &[u8]) -> Result<Vec<u8>, io::Error> {
     let mut frame = Cursor::new(Vec::with_capacity(MAX_FRAME_LENGTH));
 
     // header segment will be written at the end

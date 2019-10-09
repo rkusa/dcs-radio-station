@@ -14,8 +14,8 @@ pub enum Error {
     Json(serde_json::error::Error),
     Request(reqwest::Error),
     Base64Decode(base64::DecodeError),
-    Ogg(ogg::reading::OggReadError),
-    OggMetadata(ogg_metadata::OggMetadataError),
+    Wav(hound::Error),
+    Opus(audiopus::Error),
     NoStationFound,
 }
 
@@ -33,10 +33,10 @@ impl fmt::Display for Error {
             _ => write!(f, "Error: {}", self.description())?,
         }
 
-        let mut cause: Option<&dyn error::Error> = self.cause();
+        let mut cause: Option<&dyn error::Error> = self.source();
         while let Some(err) = cause {
             write!(f, "  -> {}", err)?;
-            cause = err.cause();
+            cause = err.source();
         }
 
         Ok(())
@@ -55,8 +55,8 @@ impl error::Error for Error {
             Json(_) => "Error serializing/deserializing JSON RPC message",
             Request(_) => "Error sending TTS request",
             Base64Decode(_) => "Error decoding TTS audio content",
-            Ogg(_) => "Error decoding OGG audio stream",
-            OggMetadata(_) => "Error reading OGG metadata",
+            Wav(_) => "Error reading WAV file",
+            Opus(_) => "Error encoding Opus audio stream",
             NoStationFound => "No SRS station found in mission",
         }
     }
@@ -70,8 +70,8 @@ impl error::Error for Error {
             Json(ref err) => Some(err),
             Request(ref err) => Some(err),
             Base64Decode(ref err) => Some(err),
-            Ogg(ref err) => Some(err),
-            OggMetadata(ref err) => Some(err),
+            Wav(ref err) => Some(err),
+            Opus(ref err) => Some(err),
             _ => None,
         }
     }
@@ -113,14 +113,14 @@ impl From<base64::DecodeError> for Error {
     }
 }
 
-impl From<ogg::reading::OggReadError> for Error {
-    fn from(err: ogg::reading::OggReadError) -> Self {
-        Error::Ogg(err)
+impl From<hound::Error> for Error {
+    fn from(err: hound::Error) -> Self {
+        Error::Wav(err)
     }
 }
 
-impl From<ogg_metadata::OggMetadataError> for Error {
-    fn from(err: ogg_metadata::OggMetadataError) -> Self {
-        Error::OggMetadata(err)
+impl From<audiopus::Error> for Error {
+    fn from(err: audiopus::Error) -> Self {
+        Error::Opus(err)
     }
 }
